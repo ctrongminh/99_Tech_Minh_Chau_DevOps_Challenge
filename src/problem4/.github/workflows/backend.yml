@@ -1,0 +1,172 @@
+# Backend: HTTP API on EC2
+# PR -> CI only. main -> CI, build once, deploy staging, approval, deploy production.
+name: backend
+
+on:
+  pull_request:
+    paths: ["backend/**", ".github/workflows/backend.yml"]
+  push:
+    branches: [main]
+    paths: ["backend/**", ".github/workflows/backend.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  # PRs: newest push wins. main: releases queue up one after another, never cancelled.
+  group: backend-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: backend/.nvmrc
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm audit --omit=dev --audit-level=high
+      - name: Package (production dependencies only)
+        run: |
+          npm run build --if-present
+          npm prune --omit=dev
+          tar -czf "$RUNNER_TEMP/backend.tgz" --exclude=./test --exclude='./.env*' .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: backend
+          path: ${{ runner.temp }}/backend.tgz
+          retention-days: 30
+
+  deploy-staging:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: staging
+      url: ${{ vars.BACKEND_URL }}
+    concurrency:
+      group: deploy-backend-staging
+    permissions:
+      contents: read
+      id-token: write # OIDC -> AWS, no stored keys
+    env: &deploy-env
+      BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      KEY: backend/${{ github.sha }}.tgz
+      TARGET_ENV: ${{ vars.TARGET_ENV }}
+      URL: ${{ vars.BACKEND_URL }}
+    steps: &deploy-steps
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: backend
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Upload release
+        working-directory: .
+        run: aws s3 cp backend.tgz "s3://$BUCKET/$KEY"
+      - name: Roll out to instances, one at a time (SSM, no SSH)
+        working-directory: .
+        run: |
+          # Runs on each instance. If the new release is unhealthy, that instance
+          # switches back to the previous release and the rollout stops (max-errors 0).
+          remote=$(cat <<EOF
+          set -eu
+          REL=/opt/backend/releases/${GITHUB_SHA}
+          aws s3 cp s3://${BUCKET}/${KEY} /tmp/backend.tgz
+          mkdir -p \$REL && tar -xzf /tmp/backend.tgz -C \$REL
+          PREV=\$(readlink /opt/backend/current || true)  # empty on first deploy
+          [ -n "\$PREV" ] && ln -sfn \$PREV /opt/backend/previous
+          ln -sfn \$REL /opt/backend/current && systemctl restart backend
+          for i in \$(seq 30); do curl -fs localhost:3000/healthz && exit 0; sleep 2; done
+          echo "unhealthy, rolling back to \$PREV"
+          [ -n "\$PREV" ] && ln -sfn \$PREV /opt/backend/current && systemctl restart backend
+          exit 1
+          EOF
+          )
+          id=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --targets "Key=tag:App,Values=backend" "Key=tag:Env,Values=$TARGET_ENV" \
+            --max-concurrency 1 --max-errors 0 \
+            --parameters "$(jq -n --arg s "$remote" '{commands: ($s | split("\n"))}')" \
+            --comment "backend ${GITHUB_SHA::12}" \
+            --query Command.CommandId --output text)
+          echo "SSM command $id"
+          while true; do
+            status=$(aws ssm list-commands --command-id "$id" --query 'Commands[0].Status' --output text)
+            echo "status: $status"
+            case "$status" in
+              Success) break ;;
+              Pending|InProgress) sleep 10 ;;
+              *) aws ssm list-command-invocations --command-id "$id" --details \
+                   --query 'CommandInvocations[].{instance:InstanceId,status:Status,output:CommandPlugins[0].Output}'
+                 exit 1 ;;
+            esac
+          done
+      - name: Smoke test
+        id: smoke
+        working-directory: .
+        run: curl -fsS --retry 10 --retry-all-errors --retry-delay 3 "$URL/healthz"
+      - name: Roll back if smoke test failed
+        if: failure() && steps.smoke.outcome == 'failure'
+        working-directory: .
+        run: |
+          # Only servers still running this release go back; servers with no
+          # previous release (first deploy) are left alone.
+          remote=$(cat <<EOF
+          set -eu
+          [ "\$(readlink /opt/backend/current)" = "/opt/backend/releases/${GITHUB_SHA}" ] || exit 0
+          PREV=\$(readlink /opt/backend/previous || true)
+          [ -n "\$PREV" ] || { echo "no previous release"; exit 0; }
+          ln -sfn \$PREV /opt/backend/current && systemctl restart backend
+          for i in \$(seq 30); do curl -fs localhost:3000/healthz && exit 0; sleep 2; done
+          exit 1
+          EOF
+          )
+          id=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --targets "Key=tag:App,Values=backend" "Key=tag:Env,Values=$TARGET_ENV" \
+            --max-concurrency 50% \
+            --parameters "$(jq -n --arg s "$remote" '{commands: ($s | split("\n"))}')" \
+            --comment "rollback backend ${GITHUB_SHA::12}" \
+            --query Command.CommandId --output text)
+          while true; do
+            status=$(aws ssm list-commands --command-id "$id" --query 'Commands[0].Status' --output text)
+            echo "rollback status: $status"
+            case "$status" in
+              Success) break ;;
+              Pending|InProgress) sleep 10 ;;
+              *) echo "::error::Rollback failed, manual action needed"; exit 1 ;;
+            esac
+          done
+          curl -fsS --retry 10 --retry-all-errors --retry-delay 3 "$URL/healthz"
+          echo "::error::Rolled back ${GITHUB_SHA::12} after a failed smoke test"
+          exit 1
+
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: # required reviewers configured on this environment
+      name: production
+      url: ${{ vars.BACKEND_URL }}
+    concurrency:
+      group: deploy-backend-production
+    permissions:
+      contents: read
+      id-token: write
+    env: *deploy-env
+    steps: *deploy-steps
