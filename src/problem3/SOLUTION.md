@@ -67,3 +67,26 @@ Note: `nginx/nginx.conf` is an empty file. It isn't mounted, so it's harmless to
 - **Managed data stores** (RDS or Cloud SQL, ElastiCache) with backups and HA. Add PgBouncer if the replica count grows.
 - **Secrets** in a secret manager, not in compose or source. Images pinned by digest and scanned for vulnerabilities.
 - **Code review checklist**: every client has an `error` listener, every timeout is explicit (no infinite defaults), non-critical dependencies are kept off the request's critical path, and the process shuts down gracefully.
+
+
+## Suggestions for the application
+
+**Done**
+
+- **Node.js upgraded** from `node:20-alpine` (end of life April 2026, no more security fixes) to `node:24.22.1-alpine3.24`, which includes the [21 Oct 2026 security releases](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases) (Brotli RCE, TLS hostname-check bypasses and others). Next step: pin the image by digest as well.
+
+**Recommended**
+
+| Area | Suggestion | Why |
+|---|---|---|
+| Reliability | Add a readiness check (e.g. `/ready`) that verifies Postgres, separate from `/status` | `/status` reports healthy during a DB outage, so nothing can take the API out of rotation |
+| Reliability | Validate required config (`DB_HOST`, `DB_USER`, `REDIS_HOST`, …) at startup and exit with a clear message | A missing variable otherwise shows up later as confusing runtime errors |
+| Reliability | Remove the `last_call` Redis write or give Redis a real purpose (e.g. caching with a TTL) | Today it is written on every request and never read: a dependency that can only cause failures |
+| Observability | Structured JSON logs (`pino` / `pino-http`) with a request ID | Trace one request across nginx and the API |
+| Observability | Metrics endpoint (`prom-client`): request rate, latency, errors, DB pool counts | The alerts above need these numbers |
+| Build | Commit `package-lock.json` and build with `npm ci` | No lockfile + `^` ranges = every build can install different versions |
+| Build | Add a `.dockerignore` (`node_modules`, `.env`, `.git`) | Keeps secrets and local artefacts out of the image if the build context grows |
+| Security | `helmet`, `app.disable('x-powered-by')`, rate limiting (`limit_req` in nginx) | Basic HTTP hardening |
+| Security | Docker secrets or a secret manager instead of plain env vars for DB credentials | Passwords in `.env` / environment leak via `docker inspect` and logs |
+| Quality | Unit tests plus an integration test through nginx that also stops Redis and Postgres | Would have caught the 3000/3001 mismatch and the Redis hang |
+| Quality | Rename `/api/users` (it returns the DB time) or make it query a users table | The name doesn't match the behaviour |

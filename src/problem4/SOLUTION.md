@@ -94,9 +94,102 @@ flowchart LR
 - **Serialised deploys.** Only one deploy per environment runs at a time, and it's never cancelled half-way. PR runs cancel their older runs.
 - **Traceability.** Every deploy appears in the GitHub environment history with its commit SHA.
 
+## Alternative: AWS CodeDeploy for the backend
+
+The backend deploy step can use AWS CodeDeploy instead of SSM Run Command. `backend.yml` keeps SSM as the default; the swap is two steps. Build, upload to S3, smoke test, approval and the frontend pipeline stay the same.
+
+### Replacement steps in `backend.yml`
+
+Replaces "Roll out to instances, one at a time (SSM, no SSH)":
+
+```yaml
+      - name: Deploy with CodeDeploy
+        working-directory: .
+        run: |
+          # Remember what is live now, so a failed smoke test can go back to it.
+          prev=$(aws deploy get-deployment-group --application-name backend \
+            --deployment-group-name "$TARGET_ENV" \
+            --query 'deploymentGroupInfo.lastSuccessfulDeployment.deploymentId' --output text)
+          echo "PREV_DEPLOYMENT=$prev" >> "$GITHUB_ENV"
+
+          id=$(aws deploy create-deployment \
+            --application-name backend \
+            --deployment-group-name "$TARGET_ENV" \
+            --s3-location "bucket=$BUCKET,key=$KEY,bundleType=tgz" \
+            --description "backend ${GITHUB_SHA::12}" \
+            --query deploymentId --output text)
+          echo "CodeDeploy deployment $id"
+          aws deploy wait deployment-successful --deployment-id "$id"
+```
+
+Replaces "Roll back if smoke test failed":
+
+```yaml
+      - name: Roll back if smoke test failed
+        if: failure() && steps.smoke.outcome == 'failure'
+        working-directory: .
+        run: |
+          if [ -z "$PREV_DEPLOYMENT" ] || [ "$PREV_DEPLOYMENT" = "None" ]; then
+            echo "::error::No previous release to restore (first deploy)"; exit 1
+          fi
+          # Redeploy the revision that was live before this run.
+          revision=$(aws deploy get-deployment --deployment-id "$PREV_DEPLOYMENT" \
+            --query 'deploymentInfo.revision' --output json)
+          id=$(aws deploy create-deployment \
+            --application-name backend \
+            --deployment-group-name "$TARGET_ENV" \
+            --revision "$revision" \
+            --description "rollback ${GITHUB_SHA::12}" \
+            --query deploymentId --output text)
+          aws deploy wait deployment-successful --deployment-id "$id"
+          curl -fsS --retry 10 --retry-all-errors --retry-delay 3 "$URL/healthz"
+          echo "::error::Rolled back ${GITHUB_SHA::12} after a failed smoke test"
+          exit 1
+```
+
+### Assumed `appspec.yml` in the backend repo
+
+CodeDeploy runs hook scripts that ship inside the release, so these live at the root of the backend repo and end up in `backend.tgz`:
+
+```yaml
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /opt/backend/app
+file_exists_behavior: OVERWRITE
+hooks:
+  ApplicationStart:
+    - location: deploy/start.sh      # systemctl restart backend
+      timeout: 60
+  ValidateService:
+    - location: deploy/validate.sh   # curl localhost:3000/healthz, retry ~60s
+      timeout: 90
+```
+
+### What changes in the assumptions
+
+- **Server agent:** servers run the **CodeDeploy agent**. The SSM agent and the `App`/`Env` tags are no longer used for deploys.
+- **Infrastructure:** a CodeDeploy application `backend` exists, with one deployment group per environment named `staging` and `production` (matching `TARGET_ENV`). Each group has:
+  - the load balancer's target group;
+  - the `CodeDeployDefault.OneAtATime` deployment config;
+  - auto-rollback on deployment failure and on CloudWatch alarms (e.g. a 5xx spike).
+- **Deploy role:** the IAM role also needs `codedeploy:CreateDeployment`, `GetDeployment`, `GetDeploymentGroup` and `GetDeploymentConfig`.
+- **Systemd and folders:** CodeDeploy copies the release into `/opt/backend/app` and keeps old revisions itself. So there are no `releases/`, `current` or `previous` symlinks, and the systemd unit's `WorkingDirectory` is `/opt/backend/app`.
+
+### SSM vs CodeDeploy
+
+| | SSM Run Command (default) | CodeDeploy |
+|---|---|---|
+| Load balancer | requests can drop during a restart | each server is taken out, drained, deployed, health-checked, put back |
+| Rollback | our own shell commands (symlink switch) | built in: failed hook or alarm redeploys the last good revision |
+| Pipeline code | heredoc + polling loop | `create-deployment` + `wait` |
+| Extra setup | SSM agent, instance tags | CodeDeploy agent, application, deployment groups, `appspec.yml` + 2 hook scripts |
+| Best for | small fleets, minimal AWS setup | servers behind a load balancer where dropped requests matter |
+
 ## Deliberately left out
 
-- **Taking instances out of the load balancer during restart.** A restart may drop a few in-flight requests. If that matters, the next step is AWS CodeDeploy (load balancer-aware, alarm-based rollback).
+- **Taking instances out of the load balancer during restart (SSM path).** A restart may drop a few in-flight requests. If that matters, switch to the CodeDeploy alternative above.
 - **Database migrations.** They need their own step and an expand/contract discipline.
 - **Infrastructure as code** for the EC2, S3, CloudFront and IAM pieces assumed above.
 - **E2E tests on staging, preview environments, notifications, Dependabot.** All useful, but not needed for a first production-ready version.

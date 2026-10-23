@@ -9,7 +9,7 @@ This plan covers two features of a Binance-like exchange on AWS, user accounts a
 
 The matching engine, wallets and market data are out of scope. I treat the trading core as an existing system that publishes every trade as an event.
 
-The three requested deliverables are sections 1–3. How each feature works, high availability and cost follow as supporting detail.
+The three requested deliverables are sections 1–3. How each feature works, the latency budget, high availability and cost follow as supporting detail.
 
 ## Assumptions
 
@@ -85,6 +85,21 @@ Logins go to Cognito; bots' API keys and all trade history live in DynamoDB, rep
 3. The History API serves the last 90 days from DynamoDB with cursor paging. The first page is cached in Redis for 5 seconds.
 4. Data Firehose copies every trade to S3 as Parquet. Older history and CSV exports run as Athena queries, and the file is delivered by a pre-signed S3 link.
 
+## Latency budget
+
+How a typical history or API-key request stays under the p99 100 ms target, measured from when it reaches AWS:
+
+| Hop | Typical p99 |
+| --- | --- |
+| CloudFront + WAF | 5–10 ms |
+| ALB | 2–5 ms |
+| Service code + JWT check (done locally) | 5–10 ms |
+| Redis (API-key cache, first page of history) | about 1 ms |
+| DynamoDB query (one key, one page) | 10–20 ms |
+| **Total** | **about 25–45 ms**, leaving room under 100 ms |
+
+Each request makes at most one DynamoDB query with a fixed page size, and slow work such as CSV exports runs in the background. Login goes to Cognito over several round trips, so it is measured separately from the 100 ms target for our own API.
+
 ## 2. Why each service, and the alternatives considered
 
 | Service | Role | Alternatives considered |
@@ -124,8 +139,37 @@ Logins go to Cognito; bots' API keys and all trade history live in DynamoDB, rep
 
 ## Cost
 
-- **Pay per use where load is uneven:** DynamoDB on-demand, Cognito priced per active user, Athena per query.
-- **Graviton and spot:** EKS nodes on Graviton, with stateless pods on spot instances and on-demand fallback.
+Rough monthly estimate for the primary region (Singapore) plus the Tokyo standby, at on-demand prices. Approximate figures, as of October 2026; confirm in the AWS Pricing Calculator before committing.
+
+Volume assumptions: 500 requests/second averaged over the month (about 1.3 billion requests), about 5 KB per response, 150k monthly active users, 5 million trades a day.
+
+| Item | Sizing | ~USD / month |
+| --- | --- | --- |
+| CloudFront | 1.3B HTTPS requests, about 6.5 TB out | 2,500 |
+| Cognito (Essentials tier) | 150k monthly active users, first 10k free | 2,100 |
+| DynamoDB (on-demand, Global Table to Tokyo) | About 1B reads, 300M writes in each region, 450 GB per region | 850 |
+| AWS WAF | 1 web ACL, about 10 rules, 1.3B requests | 800 |
+| Amazon MSK | 3 × kafka.m7g.large, 300 GB storage | 600 |
+| EKS worker nodes | 6 × m7g.large (Graviton) | 450 |
+| ElastiCache Redis | 2 × cache.m7g.large (primary + replica) | 300 |
+| Monitoring | CloudWatch, Managed Prometheus, Managed Grafana | 300 |
+| NAT gateways + cross-AZ traffic | 3 NAT gateways | 250 |
+| Standby region (Tokyo, pilot light) | EKS control plane + 2 small nodes | 200 |
+| Firehose + S3 + Athena | About 1 TB archived in year 1 | 100 |
+| EKS control plane | 1 cluster | 75 |
+| Application Load Balancer | 1 ALB | 70 |
+| Route 53, KMS, Secrets Manager | | 30 |
+| **Total** | | **about 8,600** (range 7,000–10,000) |
+
+Per-request services (CloudFront, WAF) and per-user Cognito are about 60% of the bill; the servers are a small share. If 500 requests/second is the peak rather than the average, those per-request lines fall in proportion.
+
+**Ways to cut it:**
+
+- **Skip CloudFront for API traffic.** API responses can't be cached, so attaching the WAF to the ALB and serving only the web app through CloudFront saves about USD 2,000/month, at the cost of losing edge DDoS absorption for the API.
+- **Cognito Lite tier** (about USD 0.0055 per user instead of 0.015) if the Essentials features aren't needed: about USD 1,300/month.
+- **Smaller instance types once real load is known.** The sizes above are a safe starting point, not a requirement. If load tests and the first weeks of metrics show low usage, step down: EKS nodes to m7g.medium, Redis to cache.t4g.medium, and MSK brokers to kafka.t3.small (or MSK Serverless at low volume). That can roughly halve the MSK, EC2 and Redis lines (about USD 1,350 today). Resize only after checking CPU, memory and p99 latency, and keep enough nodes spread across AZs to survive losing one AZ.
+- **Commitments for the always-on baseline:** a 1-year Compute Savings Plan for EKS nodes and reserved ElastiCache nodes take roughly 30% off those lines.
+- **Graviton and spot:** stateless pods on spot instances, with on-demand fallback.
 - **Tiered storage:** DynamoDB keeps only 90 days (TTL). Older trades sit in S3 and move to Glacier after 1 year.
 - **Pilot-light standby region:** only DynamoDB replicas and a minimal EKS node group run in Tokyo until failover.
 
